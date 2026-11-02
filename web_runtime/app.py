@@ -58,9 +58,16 @@ def create_app(storage=None):
         FastAPI 应用；单进程调度，不支持多个 Uvicorn worker。
     """
     root = Path(storage or Path(tempfile.gettempdir()) / "aicd-v4").resolve()
+    #创建一个临时目录用于存储任务数据，确保与源码仓库隔离。
     root.mkdir(parents=True, exist_ok=True)
+
+    #store是一个持久化存储对象，用于记录任务的状态和数据；processes是一个字典，用于跟踪正在运行的任务进程。
     store, processes = Store(root / "tasks.sqlite"), {}
+
+    #生成一个随机的本地令牌，用于验证请求来源，防止未经授权的访问。
     token = secrets.token_urlsafe(32)
+
+    #创建一个线程锁，用于在多线程环境中保护对共享资源的访问，确保任务调度和状态更新的线程安全。
     application_lock = Lock()
 
     async def monitor(task_id, process):

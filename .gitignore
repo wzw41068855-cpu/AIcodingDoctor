@@ -1,0 +1,17 @@
+# 本地凭据、虚拟环境、运行缓存与输出
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+logs/
+data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+/.env.example
+/.gitignore
+/docs/

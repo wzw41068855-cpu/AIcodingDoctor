@@ -29,3 +29,13 @@ def register(server, ctx) -> None:
                 raise ValueError("同步超出任务范围")
             return ctx.service.sync_changed_files(paths)
         return ctx.invoke("sync_changed_files", node, sync)
+
+    @server.tool()
+    def search_context(query: str, top_k: int = 3, node: NodeName = "runtime") -> dict[str, object]:
+        """检索小块并扩展当前父源码，返回版本与过期标识。"""
+        return ctx.invoke("search_context", node, lambda: ctx.service.search_context(query, top_k))
+
+    @server.tool()
+    def find_references(name: str, path: str | None = None, node: NodeName = "runtime") -> dict[str, object]:
+        """返回静态调用位置，不声称覆盖 Python 动态调用。"""
+        return ctx.invoke("find_references", node, lambda: [r.model_dump() for r in ctx.service.find_references(name, path)])

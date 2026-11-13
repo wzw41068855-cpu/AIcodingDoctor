@@ -10,6 +10,7 @@ from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 
 import config
+from security.credentials import credential
 from utils.logger import get_logger
 from utils.operation_timing import timed, timed_operation
 
@@ -45,7 +46,7 @@ class VectorStoreManager:
         self.collection_name = collection_name
         load_dotenv(config.BASE_DIR / ".env")
 
-        api_key = os.getenv("DASHSCOPE_API_KEY")
+        api_key = credential("EMBEDDING")
 
         if not api_key:
             raise ValueError("未配置 DASHSCOPE_API_KEY")

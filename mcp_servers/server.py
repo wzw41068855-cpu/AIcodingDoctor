@@ -36,8 +36,8 @@ def create_server(context: ToolContext) -> MCPServer:
         module.register(server, context)#它把文件、搜索、Git、执行四类能力统一挂到同一个 MCP 进程里。
     lock = anyio.Lock()#anyio.Lock 是异步锁，专门给 async/await 用：
     known = {"list_files", "read_file", "snapshot", "apply_patch", "current_changes",
-             "search_code", "find_symbol", "sync_changed_files", "git_status", "git_diff",
-             "git_log", "run_pytest"}
+             "search_code", "search_context", "find_references", "find_symbol", "sync_changed_files", "git_status", "git_diff",
+             "git_log", "run_pytest", "preview_patch", "add_regression_test"}
 
     async def audit_request(request, call_next):
         """审计 SDK 参数校验前的请求，串行执行避免跨工具状态竞争。
@@ -58,6 +58,20 @@ def create_server(context: ToolContext) -> MCPServer:
             context.audit.append({"phase": "start", "tool": "rpc." + tool, "call_id": call_id})
             status = "completed"
             try:
+                if context.config.enforce_roles:
+                    import os
+                    import hmac
+                    import hashlib
+                    arguments = params.get("arguments", {})
+                    role = arguments.get("node", "runtime")
+                    token = arguments.pop("_capability", "")
+                    secret = os.environ.get("AICD_ROLE_SECRET", "")
+                    expected = hmac.new(secret.encode(), role.encode(), hashlib.sha256).hexdigest()
+                    if not secret or not hmac.compare_digest(token, expected):
+                        raise ValueError("角色认证失败")
+                    context.active_role = role
+                    context.operation_id = arguments.pop("_operation_id", "")
+                    context.request_arguments = dict(arguments)
                 result = await call_next(request)
                 #request：当前这次 MCP 请求对象
                 #call_next：表示“按正常链路继续处理这个请求”

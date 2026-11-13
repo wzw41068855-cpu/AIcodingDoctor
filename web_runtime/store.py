@@ -43,24 +43,73 @@ class Store:
             ids = db.execute("SELECT id FROM tasks ORDER BY rowid DESC LIMIT 100").fetchall()
         return [self.get(row[0]) for row in ids]
 
-    def update(self, task_id, status, **fields):
+    def update(self, task_id, status, *, expected=None, **fields) -> bool:
         """原子合并视图并记录事件；调用者只传入已脱敏业务数据。"""
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT data FROM tasks WHERE id=?", (task_id,)).fetchone()
+            row = db.execute("SELECT data,status FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            current = row[1]
+            if expected is not None and current != expected:
+                return False
+            allowed = {
+                "queued": {"running", "waiting", "success", "blocked"},
+                "running": {"waiting", "paused", "cancelling", "success", "failed", "blocked"},
+                "waiting": {"running", "paused", "cancelling", "blocked"},
+                "paused": {"running", "waiting", "cancelling", "blocked"},
+                "cancelling": {"cancelled", "blocked"},
+                # 仅宿主显式建立新的审批点可解除 blocked；普通进度不能复活任务。
+                "blocked": {"waiting"} if fields.get("approval") else set(),
+            }
+            if status != current and status not in allowed.get(current, set()):
+                return False
             # 节点状态含 list[ChangeRecord] 等嵌套模型，必须递归转换，
             # 仅调用顶层 model_dump 无法让 SQLite 的 JSON 序列化安全完成。
-            fields = to_jsonable_python(fields)
+            from graph.test_runner import redact_data
+            fields = redact_data(to_jsonable_python(fields))
             data = json.loads(row[0]) | fields
             db.execute("UPDATE tasks SET status=?,data=? WHERE id=?", (status, json.dumps(data), task_id))
             db.execute("INSERT INTO events(task,data) VALUES (?,?)", (task_id, json.dumps(dict(status=status, **fields))))
 
-    def claim(self, task_id, expected):
+            return True
+
+    def claim(self, task_id: str, expected: str, approval_id: str | None = None) -> bool:
         """仅允许一个请求领取当前状态；重复审批或并发恢复返回 False。"""
+        if expected not in {"queued", "waiting", "paused"}:
+            return False
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if approval_id is not None:
+                row = db.execute("SELECT data FROM tasks WHERE id=?", (task_id,)).fetchone()
+                if row is None or (json.loads(row[0]).get("approval") or {}).get("id") != approval_id:
+                    return False
             return db.execute("UPDATE tasks SET status='running' WHERE id=? AND status=?", (task_id, expected)).rowcount == 1
 
     def events(self, task_id, after=0):
         """返回序号之后的持久事件，供 SSE 重连和页面刷新重放。"""
         with self.connection() as db:
             return db.execute("SELECT seq,data FROM events WHERE task=? AND seq>? ORDER BY seq LIMIT 200", (task_id, after)).fetchall()
+
+    def enqueue_feedback(self, task_id: str, feedback: dict) -> bool:
+        """在状态检查事务中追加反馈，避免覆盖取消或并发意见。
+
+        Args:
+            task_id: 任务 ID。
+            feedback: 不包含授权字段的用户文本。
+        Returns:
+            是否在运行态接受了反馈。
+        """
+        from graph.test_runner import redact_data
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status,data FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row[0] != "running":
+                return False
+            data = json.loads(row[1])
+            data["user_feedback"] = data.get("user_feedback", []) + [redact_data(feedback)]
+            db.execute("UPDATE tasks SET data=? WHERE id=?", (json.dumps(data), task_id))
+            db.execute("INSERT INTO events(task,data) VALUES (?,?)", (task_id, json.dumps({"feedback_received": True})))
+        return True

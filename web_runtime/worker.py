@@ -1,35 +1,31 @@
-"""单任务子进程：保持 Web 路由与业务、MCP 生命周期分离。"""
+﻿"""V5 单任务 Worker：只读初始化、持久预算、阶段级多 Agent。"""
 
 import json
 import os
 from pathlib import Path
+import secrets
 import sys
-from pydantic_core import to_jsonable_python
+from typing import Any
 
 from web_runtime.store import Store
 
 
-def run(directory):
-    """运行到完成或下一个审批点；异常记录安全诊断，不保存凭据或 SDK 原文。
+def run(directory: str | Path) -> None:
+    """运行到终态或持久审批点，异常保留现场。
 
     Args:
-        directory: 调度器创建的独立任务目录。
-    Notes:
-        每次恢复重新建立 MCP 会话；SqliteSaver 保存 Graph 状态。
-        进程中途崩溃的写入不自动重放，由调度器标记为 blocked。
+        directory: 调度器创建的任务目录。
     """
     from langgraph.checkpoint.sqlite import SqliteSaver
     from langgraph.types import Command
     from langchain_openai import ChatOpenAI
-    from audit.writer import AuditWriter
-    from graph.editor import Workspace
-    from graph.nodes import RepairNodes
+    from graph.agent_tools import AgentTools
+    from graph.autonomous import AutonomousAgents
+    from graph.budget import Budget, Limits
     from graph.test_runner import redact_data
-    from mcp_client.client import connect, SearchProxy, EditorProxy, RunnerProxy
-    from mcp_servers.context import TaskConfig
-    from sandbox.docker_runner import DockerRunner
-    from workspace.manager import WorktreeManager
-    from web_runtime.workflow import build_graph
+    from mcp_client.client import connect
+    from security.credentials import credential
+    from web_runtime.task_setup import initialize
     import config
 
     directory = Path(directory)
@@ -37,92 +33,113 @@ def run(directory):
     task_id = directory.name
     data = store.get(task_id)
     options = data["options"]
-    runner = None
-    stage = "任务初始化"
+    budget = Budget(directory / "budget.sqlite", Limits.model_validate(options.get("budget", {})))
+    stage, result = "任务初始化", {}
+    approval_wait = False
     try:
-        task_path = directory / "task.json"
-        if not task_path.exists():
-            stage = "校验源仓库路径"
-            manager = WorktreeManager(Path(options["repository"]), directory,
-                                      AuditWriter(directory / "audit.jsonl", task_id))
-            stage = "创建隔离 Git worktree"
-            root = manager.create()
-            stage = "校验工作区和测试路径"
-            workspace = Workspace(root, trusted_copy=True)
-            runner = DockerRunner(workspace, options["tests"], options["image"],
-                                  timeout=options["timeout"], task_id=task_id, artifacts=directory)
-            stage = "检查本地 Docker 镜像"
-            image = runner.preflight() if options["mode"] == "repair" else options["image"]
-            task = TaskConfig(task_id=task_id, workspace=str(root), artifacts=str(directory),
-                base_commit=manager.base, allowed_files=options["allowed_files"], tests=options["tests"],
-                image=image, timeout=options["timeout"], trusted_copy=True)
-            task_path.write_text(task.model_dump_json(), encoding="utf-8")
-        stage = "加载任务配置"
-        task = TaskConfig.model_validate_json(task_path.read_text(encoding="utf-8"))
-        workspace = Workspace(task.workspace, trusted_copy=True)
-        runner = DockerRunner(workspace, task.tests, task.image, timeout=task.timeout,
-                              task_id=task_id, artifacts=directory)
+        task = initialize(directory, options)
+        if not task.enforce_roles:
+            raise ValueError("旧 V4 任务配置未启用角色认证，请保留现场并新建 V5 任务")
+        # 每次 Worker 创建新通道密钥，模型输入和持久产物均不包含它。
+        os.environ["AICD_ROLE_SECRET"] = secrets.token_hex(32)
         stage = "初始化模型"
         model = ChatOpenAI(model=options["model"] or config.LLM_MODEL,
-            base_url=options["base_url"] or config.LLM_BASE_URL,
-            api_key=os.environ.get("AICD_WEB_API_KEY") or os.environ.get("DASHSCOPE_API_KEY"),
-            max_tokens=options["max_tokens"], timeout=60, max_retries=1)
+            base_url=options["base_url"] or config.LLM_BASE_URL, api_key=credential("LLM"),
+            max_tokens=options["max_tokens"], timeout=config.MODEL_TIMEOUT,
+            max_retries=config.MODEL_MAX_RETRIES,
+            extra_body={"enable_thinking": config.QWEN_ENABLE_THINKING}
+            if (options["model"] or config.LLM_MODEL).startswith("qwen") else None)
         stage = "连接 MCP 和 SQLite Checkpointer"
-        with connect(task_path) as rpc, SqliteSaver.from_conn_string(str(directory / "graph.sqlite")) as saver:
-            service = SearchProxy(workspace.root, rpc)
+        with connect(directory / "task.json") as rpc, SqliteSaver.from_conn_string(str(directory / "graph.sqlite")) as saver:
+            def events(message: str) -> None:
+                """保存简短行动说明，取消状态不能被进度覆盖。"""
+                if store.get(task_id)["status"] != "running":
+                    raise RuntimeError("任务已取消或暂停，停止后续调用")
+                store.update(task_id, "running", progress=message, budget=budget.snapshot())
 
-            def events(message):
-                """保存节点进度并维持 V3 审计节点归因。"""
-                for name in ("Planner", "Coder", "Tester", "Reviewer", "Finalizer"):
-                    if message.startswith("进入 " + name):
-                        rpc.node = name
-                store.update(task_id, "running", progress=message, current_node=rpc.node)
-
-            if options["mode"] == "ask":
-                stage = "只读代码问答"
-                evidence = service.search_code(options["request"], top_k=3)
-                answer = model.invoke([("system", "你是只读代码问答助手。根据检索证据回答，不执行修改。"),
-                    ("user", json.dumps({"question": options["request"], "evidence": [r.model_dump() for r in evidence]}, ensure_ascii=False))])
-                store.update(task_id, "success", answer=redact_data(str(answer.content)))
-                return
-            nodes = RepairNodes(service, EditorProxy(workspace, rpc), RunnerProxy(workspace, task.tests, rpc), model, directory, events)
-            nodes.max_prompt_chars = options.get("context_chars", 24000)
-            graph = build_graph(nodes, saver)
-            cfg = {"configurable": {"thread_id": task_id}, "recursion_limit": 200}
+            tools = AgentTools(rpc, directory, task.allowed_files, options["mode"], budget=budget)
+            tools.repository = Path(task.workspace)
+            tools.tests = task.tests
+            agents = AutonomousAgents(model, tools, budget, events, options["context_chars"])
+            from memory.experience import ExperienceStore
+            agents.experiences = ExperienceStore(directory.parent / "experiences.sqlite").retrieve(options["repository"], options["request"])
+            agents.feedback_provider = lambda: store.get(task_id).get("user_feedback", [])
+            graph = agents.build(saver)
+            cfg = {"configurable": {"thread_id": task_id}, "recursion_limit": 1000}
             snapshot = graph.get_state(cfg)
             if snapshot.values:
-                argument = Command(resume=data["decision"])
+                argument: Any = Command(resume=data["decision"])
             else:
-                argument = dict(task_id=task_id, user_request=options["request"], workspace_root=task.workspace,
-                    status="running", iteration=0, max_iterations=options["max_iterations"], changes=[], index_dirty=False)
-            stage = "执行修复图"
-            # updates 流按节点提供输出；保存节点名、轮次及结果，刷新页面后
-            # 仍可区分 Planner 计划、Coder 修改、Tester 测试与 Reviewer 判断。
+                argument = {"user_request": options["request"], "mode": options["mode"],
+                    "status": "running", "iteration": 0, "max_iterations": options["max_iterations"],
+                    "changes": [], "evidence": options.get("conversation", [])}
+            stage = "执行自主 Agent 图"
             for update in graph.stream(argument, cfg, stream_mode="updates"):
                 for name, values in update.items():
                     if name == "__interrupt__":
                         continue
-                    outputs = store.get(task_id).get("node_results", {})
-                    outputs[name] = redact_data(to_jsonable_python(values))
-                    store.update(task_id, "running", current_node=name, node_results=outputs)
+                    store.update(task_id, "running", current_node=name, budget=budget.snapshot())
             snapshot = graph.get_state(cfg)
-            result = snapshot.values
+            result = dict(snapshot.values)
             pending = [i for t in snapshot.tasks for i in t.interrupts]
-            waiting_status = "paused" if store.get(task_id).get("pause_requested") else "waiting"
-            store.update(task_id, waiting_status if pending else result["status"],
-                pause_requested=False,
-                approval={"id": pending[0].id, **pending[0].value} if pending else None,
-                result=redact_data(to_jsonable_python(result)), diff=nodes.editor.diff(),
-                current_node=snapshot.next[0] if snapshot.next else "Finalizer")
+            if pending:
+                approval_wait = True
+                status = "paused" if store.get(task_id).get("pause_requested") else "waiting"
+                store.update(task_id, status, pause_requested=False,
+                    approval={"id": pending[0].id, **pending[0].value}, result=redact_data(result),
+                    budget=budget.snapshot(), current_node=snapshot.next[0])
+                return
+            rpc.node = "runtime"
+            if task.readonly and result.get("status") == "success":
+                # 模型结束与报告发布之间也可能发生源码变化，最终再核验一次。
+                from services.citations import validate_citations
+                result["citations"] = validate_citations(result["answer"], agents.memory.load()["facts"], Path(task.workspace))
+            changes = [] if task.readonly else rpc.call("current_changes")
+            diff = "" if task.readonly else rpc.call("git_diff")
+            if not task.readonly and changes != result.get("changes", []):
+                # 工具返回顺序可能不同，比较规范化后的实际哈希。
+                from graph.operations import digest
+                if digest(sorted(changes, key=lambda r: r["path"])) != digest(sorted(result.get("changes", []), key=lambda r: r["path"])):
+                    result.update(status="blocked", error="测试后源码发生变化，需重新验收")
+            report = {"status": result["status"], "changes": changes, "tests": result.get("test_result"),
+                "test_history": result.get("test_history", []),
+                "review": result.get("review_result"), "error": result.get("error"),
+                "citations": result.get("citations", []), "context": getattr(agents.memory, "last_usage", {}),
+                "budget": budget.snapshot(), "remaining_issues": [] if result["status"] == "success" else [result.get("error") or "任务未完成"],
+                "limits": ["仅验证可见测试；Python 动态调用不保证静态完整性"],
+                "diff_path": str(directory / "changes.diff"), "report_path": str(directory / "report.json")}
+            if not task.readonly:
+                from graph.editor import Workspace
+                from sandbox.docker_runner import DockerRunner
+                # 清理也是验收的一部分，必须在发布 success 之前完成。
+                DockerRunner(Workspace(task.workspace, trusted_copy=True), task.tests, task.image,
+                    timeout=task.timeout, task_id=task_id, artifacts=directory).cleanup_remaining()
+            result["final_report"] = redact_data(report)
+            (directory / "changes.diff").write_text(redact_data(diff), encoding="utf-8")
+            (directory / "report.json").write_text(json.dumps(result["final_report"], ensure_ascii=False, indent=2), encoding="utf-8")
+            store.update(task_id, result["status"], result=redact_data(result), diff=redact_data(diff),
+                answer=redact_data(result.get("answer", "")), approval=None, budget=budget.snapshot())
+            store.update(task_id, result["status"], resources_cleaned=True)
     except Exception as exc:
         from web_runtime.diagnostics import record_failure
-        store.update(task_id, "blocked", **record_failure(directory, exc, stage))
+        failure = record_failure(directory, exc, stage)
+        store.update(task_id, "blocked", **failure, budget=budget.snapshot(),
+            result=redact_data({**result, "status": "blocked", "error": failure.get("error"), "final_report": {"status": "blocked", "budget": budget.snapshot(),
+                "remaining_issues": [failure.get("error", "执行未完成，请检查诊断及副作用账本")]}}))
     finally:
-        if runner:
-            try:
-                runner.cleanup_remaining()
-            except Exception:
-                store.update(task_id, "blocked", error="容器清理失败，请检查任务审计")
+        path = directory / "task.json"
+        if path.exists():
+            from mcp_servers.context import TaskConfig
+            task = TaskConfig.model_validate_json(path.read_text(encoding="utf-8"))
+            if not task.readonly and not approval_wait and not store.get(task_id).get("resources_cleaned"):
+                from graph.editor import Workspace
+                from sandbox.docker_runner import DockerRunner
+                try:
+                    DockerRunner(Workspace(task.workspace, trusted_copy=True), task.tests, task.image,
+                        timeout=task.timeout, task_id=task_id, artifacts=directory).cleanup_remaining()
+                except Exception:
+                    # 清理失败必须阻止应用，即使业务刚刚成功。
+                    store.update(task_id, "blocked", error="容器清理失败，请检查任务审计", expected="running")
 
 
 if __name__ == "__main__":

@@ -171,21 +171,14 @@ class Editor:
             raise ValueError("读取期间文件发生变化")
         return {"path": path, "content": context.content, "expected_hash": sha256(raw)}
 
-    @timed("编辑器：校验与应用补丁")
-    def apply(self, batch: EditBatch, allowed: list[str]) -> list[ChangeRecord]:
-        """整批验证精确定位、版本、编码和语法，再原子替换每个文件。
-        先验证、后暂存、再原子替换、失败可回滚。
+    def prepare(self, batch: EditBatch, allowed: list[str]) -> dict:
+        """校验整批补丁并计算字节，不产生写入。
+
         Args:
-            batch: 模型输出经 Pydantic 验证后的替换块。
-            allowed: Planner 校验通过的目标文件白名单。
+            batch: 候选补丁。
+            allowed: 宿主授权路径。
         Returns:
-            成功应用的变更哈希记录。
-        Raises:
-            ValueError: 无效或重复路径、版本冲突、定位失败、语法错误。
-            OSError: 提交失败；尝试恢复本轮已提交文件。
-        Notes:
-            单个文件使用 os.replace；多文件不具备操作系统级事务。
-            提交失败会恢复本轮内容；恢复失败明确抛出 RuntimeError。
+            路径、原始字节和目标字节映射。
         """
         prepared = {}
         #prepared 是 Editor.apply() 里的字典，
@@ -225,6 +218,47 @@ class Editor:
             prepared[target] = (edit.path, raw, encoded)
         if len(set(self.originals) | {v[0] for v in prepared.values()}) > 8:
             raise ValueError("任务最多修改八个文件")
+        return prepared
+
+    def preview(self, batch: EditBatch, allowed: list[str]) -> dict:
+        """生成与实际执行共用校验逻辑的补丁预览。
+
+        Args:
+            batch: 候选补丁。
+            allowed: 已授权路径。
+        Returns:
+            补丁哈希、Diff 与变更记录。
+        """
+        from graph.operations import digest
+        prepared = self.prepare(batch, allowed)
+        diffs, records = [], []
+        for path, before, after in prepared.values():
+            encoding = tokenize.detect_encoding(io.BytesIO(before).readline)[0]
+            diffs.extend(difflib.unified_diff(before.decode(encoding).splitlines(True),
+                         after.decode(encoding).splitlines(True),
+                         fromfile=f"a/{path}", tofile=f"b/{path}"))
+            records.append(ChangeRecord(path=path, before_hash=sha256(before),
+                                        after_hash=sha256(after)).model_dump())
+        return {"patch_hash": digest(batch.model_dump()), "diff": "".join(diffs),
+                "changes": records}
+
+    @timed("编辑器：校验与应用补丁")
+    def apply(self, batch: EditBatch, allowed: list[str]) -> list[ChangeRecord]:
+        """整批验证精确定位、版本、编码和语法，再原子替换每个文件。
+        先验证、后暂存、再原子替换、失败可回滚。
+        Args:
+            batch: 模型输出经 Pydantic 验证后的替换块。
+            allowed: Planner 校验通过的目标文件白名单。
+        Returns:
+            成功应用的变更哈希记录。
+        Raises:
+            ValueError: 无效或重复路径、版本冲突、定位失败、语法错误。
+            OSError: 提交失败；尝试恢复本轮已提交文件。
+        Notes:
+            单个文件使用 os.replace；多文件不具备操作系统级事务。
+            提交失败会恢复本轮内容；恢复失败明确抛出 RuntimeError。
+        """
+        prepared = self.prepare(batch, allowed)
         # 在提交前保留基线，极端回滚失败时最终报告仍能展示残留修改。
 
         #原子替换与竞争窗口防护。

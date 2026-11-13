@@ -14,4 +14,24 @@ data/
 *.sqlite-wal
 /.env.example
 /.gitignore
-/docs/
+# 保留旧文档的忽略策略，仅交付本轮新增学习文档和验收证据。
+/docs/*
+!/docs/v5_01_runtime_safety.md
+!/docs/v5_02_agents.md
+!/docs/validation/
+/docs/validation/*
+!/docs/validation/step_01_02.md
+!/docs/validation/live_result.json
+!/docs/validation/live_changes.diff
+!/docs/v5_03_retrieval.md
+!/docs/v5_04_memory.md
+!/docs/v5_05_web_evaluation.md
+!/docs/validation/step_03_05.md
+!/docs/validation/news_v5/
+/docs/validation/news_v5/*
+!/docs/validation/news_v5/*.json
+/docs/validation/news_v5/retrieval_progress.json
+!/docs/validation/news_v5/unit_tests.xml
+!/docs/validation/news_v5/attempts/
+/docs/validation/news_v5/attempts/*
+!/docs/validation/news_v5/attempts/*.json

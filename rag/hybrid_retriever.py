@@ -15,6 +15,7 @@ from langchain_core.runnables import RunnableLambda
 from pydantic import PrivateAttr
 
 import config
+from security.credentials import credential
 from utils.logger import get_logger
 from utils.operation_timing import timed, timed_operation
 
@@ -82,7 +83,7 @@ class HybridCodeRetriever(BaseRetriever):
     def model_post_init(self, __context: Any) -> None:
         # 当前 community 版本的便捷构造会覆盖 model；显式传入 SDK client。
         if self.reranker is None:
-            key = os.getenv("DASHSCOPE_API_KEY")
+            key = credential("RERANK")
             if not key:
                 raise ValueError("缺少 DASHSCOPE_API_KEY 环境变量")
             self.reranker = DashScopeRerank(#创建阿里云 Rerank 对象。

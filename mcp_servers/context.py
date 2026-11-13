@@ -13,7 +13,7 @@ from workspace.manager import git
 from security.path_policy import reject_links
 
 
-NodeName = Literal["runtime", "Planner", "Coder", "Tester", "Reviewer", "Finalizer"]
+NodeName = Literal["runtime", "Planner", "Supervisor", "Explorer", "Coder", "Tester", "Reviewer", "Finalizer"]
 
 
 class TaskConfig(BaseModel):
@@ -45,12 +45,15 @@ class TaskConfig(BaseModel):
     workspace: str
     artifacts: str
     base_commit: str = Field(pattern=r"^[a-f0-9]{40,64}$")
-    allowed_files: list[str] = Field(min_length=1, max_length=8)
-    tests: list[str] = Field(min_length=1, max_length=8)
-    image: str
+    allowed_files: list[str] = Field(default_factory=list, max_length=100)
+    tests: list[str] = Field(default_factory=list, max_length=8)
+    image: str = ""
     timeout: float = Field(default=60, gt=0, le=300)
     trusted_copy: Literal[True]
     mock_index: bool = False
+    readonly: bool = False
+    enforce_roles: bool = False
+    allow_regression_tests: bool = False
 
 
 class ToolContext:
@@ -79,6 +82,11 @@ class ToolContext:
             AuditError: 初始化审计失败；后续操作保持阻塞。
         """
         self.config = config
+        self.active_role = None
+        self.operation_id = ""
+        self.request_arguments = {}
+        from graph.operations import OperationJournal
+        self.journal = OperationJournal(Path(config.artifacts) / "operations.sqlite")
         self.artifacts = Path(config.artifacts).resolve(strict=True)
         #artifacts 是任务产物目录，通常放：
         # 审计日志 audit.jsonl
@@ -86,19 +94,28 @@ class ToolContext:
         # 报告、临时文件、pytest 日志等
         self.audit = AuditWriter(self.artifacts / "audit.jsonl", config.task_id)
         with self.audit.operation("task.initialize"):
-            self.workspace = Workspace(config.workspace, trusted_copy=config.trusted_copy)
+            if config.readonly:
+                from types import SimpleNamespace
+                from services.code_search import CodeSearchService
+                root = Path(config.workspace).resolve(strict=True)
+                reject_links(root)
+                self.workspace = SimpleNamespace(root=root, max_bytes=65536)
+            else:
+                if not config.allowed_files or not config.tests:
+                    raise ValueError("修复任务需要文件和测试授权")
+                self.workspace = Workspace(config.workspace, trusted_copy=config.trusted_copy)
             marker = self.workspace.root / ".git"
-            if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096:
+            if not config.readonly and (marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096):
                 raise ValueError("任务必须使用普通 Git worktree 标记文件")
-            self._git_marker = marker.read_bytes()
+            self._git_marker = marker.read_bytes() if marker.is_file() else None
             if (self.artifacts.is_relative_to(self.workspace.root)
-                    or self.workspace.root.parent != self.artifacts
+                    or (not config.readonly and self.workspace.root.parent != self.artifacts)
                     or git(self.workspace.root, "rev-parse", "HEAD").strip() != config.base_commit):
                 raise ValueError("任务路径或基线不匹配")
             self.allowed = frozenset(config.allowed_files)
             for path in self.allowed:
                 self.workspace.path(path)
-            self.editor = Editor(self.workspace)
+            self.editor = None if config.readonly else Editor(self.workspace)
             # V4 每个审批等待点会关闭 MCP 会话；从固定 Git 提交恢复编辑基线，
             # 防止新会话丢失净修改记录。git show 仅访问已校验的白名单源码。
             for path in self.allowed:
@@ -107,7 +124,7 @@ class ToolContext:
                 # Git 工具返回 UTF-8 文本；非 UTF-8 源码明确阻塞，不猜测编码。
                 if baseline.encode("utf-8") != current:
                     self.editor.originals[path] = baseline.encode("utf-8")
-            self.runner = runner if runner is not None else DockerRunner(
+            self.runner = None if config.readonly else runner if runner is not None else DockerRunner(
                 self.workspace, config.tests, config.image, timeout=config.timeout,
                 task_id=config.task_id, artifacts=self.artifacts)
             if service is None:
@@ -142,11 +159,27 @@ class ToolContext:
         """
         try:
             with self.audit.operation(tool, node) as event:
+                if self.config.enforce_roles:
+                    from graph.permissions import authorize
+                    if node != self.active_role:
+                        raise ValueError("调用角色未由可信宿主认证")
+                    authorize(node, tool)
                 reject_links(self.workspace.root)
                 if (self.workspace.root.resolve() != self.workspace.root
-                        or (self.workspace.root / ".git").read_bytes() != self._git_marker):
+                        or (self._git_marker is not None and (self.workspace.root / ".git").read_bytes() != self._git_marker)):
                     raise ValueError("任务工作树被替换")
-                data = function()
+                if self.config.readonly and tool not in {"list_files", "read_file", "search_code", "find_symbol", "git_status", "git_log"}:
+                    raise ValueError("只读任务禁止副作用")
+                if self.config.enforce_roles and tool == "run_pytest":
+                    if not self.operation_id:
+                        raise ValueError("缺少操作 ID")
+                    from graph.editor import sha256
+                    versions = {p: sha256(self.workspace.path(p).read_bytes()) for p in self.allowed}
+                    data = self.journal.run(self.operation_id, {"tests": self.config.tests,
+                        "arguments": self.request_arguments, "versions": versions,
+                        "base": self.config.base_commit}, function)
+                else:
+                    data = function()
                 if tool == "apply_patch":
                     event["changes"] = data
                 if tool == "run_pytest":
@@ -173,4 +206,20 @@ class ToolContext:
         """
         if not allowed or not set(allowed).issubset(self.allowed):
             raise ValueError("计划超出用户授权的文件范围")
-        return [r.model_dump() for r in self.editor.apply(batch, allowed)]
+        if not self.config.enforce_roles:
+            return [r.model_dump() for r in self.editor.apply(batch, allowed)]
+        from graph.operations import digest
+        from graph.editor import sha256
+        import json
+        key = digest(batch.model_dump())
+        approved = json.loads((self.artifacts / ("approved_" + key + ".json")).read_text(encoding="utf-8"))
+        if approved["patch_hash"] != key or not self.operation_id:
+            raise ValueError("补丁未经有效审批")
+        def reconcile() -> list[dict] | None:
+            """仅确认全部目标哈希一致的已完成写入。"""
+            records = approved["changes"]
+            if all(sha256(self.workspace.path(r["path"]).read_bytes()) == r["after_hash"] for r in records):
+                return records
+            return None
+        return self.journal.run(self.operation_id, {"batch": batch.model_dump(), "allowed": allowed},
+            lambda: [r.model_dump() for r in self.editor.apply(batch, allowed)], reconcile)

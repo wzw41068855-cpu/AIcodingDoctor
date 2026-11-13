@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 import config
 from rag.loader import Loader
+from services.code_context import CodeContextMixin, source_version
 from rag.splitter.ast_tagger import AstTagger
 from utils.operation_timing import timed
 
@@ -38,9 +39,11 @@ class CodeResult(BaseModel):
     end_line: int | None = None
     content: str
     score: float | None = None
+    source_version: str | None = None
+    parent_id: str | None = None
 
 
-class CodeSearchService:
+class CodeSearchService(CodeContextMixin):
     """代码理解服务（单仓库、单进程）。
 
     说明：
@@ -107,6 +110,7 @@ class CodeSearchService:
                     "source", "file_type", "symbol_name", "qualified_name", "symbol_type",
                     "start_line", "end_line")},
                 relative_path=relative, content=doc.page_content,
+                source_version=metadata.get("source_version"), parent_id=metadata.get("parent_id"),
             ))
             if len(results) == top_k:
                 break
@@ -140,7 +144,7 @@ class CodeSearchService:
         # 保留所选行原有的换行结尾。
         physical = doc.page_content.split("\n")
         kept = [line + ("\n" if i < len(physical) - 1 else "") for i, line in enumerate(physical)][:count]
-        return CodeResult(**{**doc.metadata, "start_line": first, "end_line": last},
+        return CodeResult(**{**doc.metadata, "start_line": first, "end_line": last, "source_version": source_version(doc.page_content)},
                           content="".join(kept[first - 1:last]))
 
     def _files(self):

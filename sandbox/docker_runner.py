@@ -14,6 +14,7 @@ from threading import Event, Thread
 from time import monotonic
 from uuid import uuid4
 import xml.etree.ElementTree as ET
+import config
 
 from graph.state import TestResult
 from graph.test_runner import PytestRunner, redact
@@ -225,7 +226,7 @@ class DockerRunner:
         for command in (["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
                         ["docker", "info", "--format", "{{.OSType}}"],
                         ["docker", "image", "inspect", "--format", "{{.Id}}", self.image]):
-            code, raw, truncated = capture(command, 15)
+            code, raw, truncated = capture(command, config.DOCKER_CONTROL_TIMEOUT)
             if code or truncated:
                 raise RuntimeError("Docker 或本地镜像不可用")
             value = raw.decode("utf-8", "replace").strip()
@@ -238,7 +239,7 @@ class DockerRunner:
                     raise RuntimeError("无法确认镜像 ID")
                 self.image_id = value
         code, raw, truncated = capture(["docker", "image", "inspect", "--format",
-                                        '{{json (index .Config "Volumes")}}', self.image_id], 15)
+                                        '{{json (index .Config "Volumes")}}', self.image_id], config.DOCKER_CONTROL_TIMEOUT)
         if code or truncated or raw.strip() not in {b"null", b"{}"}:
             raise RuntimeError("测试镜像不得声明额外数据卷")
         return self.image_id
@@ -252,9 +253,24 @@ class DockerRunner:
             ValueError: 输入超过 1000 文件或 64 MiB，存在链接、硬链接或并发改动。
         """
         total = count = 0
+        names = git(self.workspace.root, "ls-files", "-z").split("\x00")
+        manifest = self.artifacts / "regression_tests.json"
+        if manifest.exists():
+            import hashlib
+            registered = json.loads(manifest.read_text(encoding="utf-8"))
+            if len(registered) > config.MAX_REGRESSION_TEST_FILES:
+                raise ValueError("回归测试清单超过上限")
+            for path, expected_hash in registered.items():
+                if not re.fullmatch(r"tests/v5_generated/test_[a-z0-9_]+\.py", path):
+                    raise ValueError("回归测试清单越界")
+                target = self.workspace.path(path, source=False)
+                if hashlib.sha256(target.read_bytes()).hexdigest() != expected_hash:
+                    raise ValueError("已审批回归测试发生变化")
+                if path not in names:
+                    names.append(path)
         # 临时目录默认 0700；只读挂载后必须允许容器的非 root 用户读取过滤快照。
         destination.chmod(0o755)
-        for name in git(self.workspace.root, "ls-files", "-z").split("\x00"):
+        for name in names:
             if not name or any(p.startswith(".") for p in name.split("/")):
                 continue
             parts = safe_relative(name)
@@ -331,7 +347,7 @@ class DockerRunner:
             用于覆盖 stdio 子进程提前退出、来不及执行 finally 的场景。
         """
         code, raw, cut = capture(["docker", "ps", "-a", "--filter", "label=aicd.task=" + self.task_id,
-                                   "--format", "{{.Names}}"], 10)
+                                   "--format", "{{.Names}}"], config.DOCKER_CONTROL_TIMEOUT)
         names = raw.decode("utf-8", "replace").splitlines()
         if code or cut or len(names) > 8 or any(not re.fullmatch(r"aicd-[a-f0-9]{32}", n) for n in names):
             raise RuntimeError("无法确认本任务残留容器，请人工检查任务标签")

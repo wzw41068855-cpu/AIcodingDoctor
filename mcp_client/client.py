@@ -50,6 +50,11 @@ class ToolRPC:
         if self.blocked:
             raise AuditError("远程任务已阻塞，禁止自动重试")
 
+        if os.getenv("AICD_ROLE_SECRET"):
+            import hmac
+            import hashlib
+            arguments["_capability"] = hmac.new(os.environ["AICD_ROLE_SECRET"].encode(),
+                                               self.node.encode(), hashlib.sha256).hexdigest()
         async def invoke():
             """在 MCP 所属循环等待请求；SDK 负责取消协议，宿主不嵌套 asyncio.run。"""
             return await self.client.call_tool(tool, dict(arguments, node=self.node),
@@ -92,7 +97,8 @@ def connect(config_path: Path, timeout: float = 360):
     """
     #构造 MCP 服务环境：只把白名单里的环境变量传给服务子进程，再添加 UTF-8 设置，避免无关环境变量（包括其他密钥）被一并继承。
     names = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "USERPROFILE", "HOME",
-             "CONDA_PREFIX", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DASHSCOPE_API_KEY"}
+             "CONDA_PREFIX", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DASHSCOPE_API_KEY", "AICD_WEB_API_KEY", "AICD_EMBEDDING_API_KEY",
+             "AICD_RERANK_API_KEY", "AICD_ROLE_SECRET"}
     env = {k: v for k, v in os.environ.items() if k.upper() in names}
     env["PYTHONIOENCODING"] = "utf-8"
     #配置 stdio 服务：

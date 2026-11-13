@@ -19,6 +19,7 @@ class DemoStore:
     def __init__(self):
         """初始化空 Chunk 字典，每次 demo 独立。"""
         self.docs = {}
+        self._collection = SimpleNamespace(update=self.update_metadata)
 
     def get(self, *, ids=None, include=(), limit=None):
         """按 V1 存储协议读取 Chunk。
@@ -53,6 +54,16 @@ class DemoStore:
         """
         for key in ids:
             self.docs.pop(key, None)
+
+    def update_metadata(self, ids: list[str], metadatas: list[dict]) -> None:
+        """支持增量索引元数据更新，与真实后端保持协议一致。
+
+        Args:
+            ids: 已存在的 Chunk ID。
+            metadatas: 对应的完整元数据。
+        """
+        for key, metadata in zip(ids, metadatas, strict=True):
+            self.docs[key] = self.docs[key].model_copy(update={"metadata": metadata})
 
 
 def demo_service(root: Path, storage: Path) -> CodeSearchService:

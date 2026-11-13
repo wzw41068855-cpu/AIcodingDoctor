@@ -19,7 +19,7 @@ def register(server, ctx) -> None:
     """
 
     @server.tool()
-    async def run_pytest(node: NodeName = "runtime") -> dict[str, object]:
+    async def run_pytest(node: NodeName = "runtime", tests: list[str] | None = None) -> dict[str, object]:
         """在线程中运行固定容器测试，并在取消时等待清理完成后再退出。
 
         为什么这样实现：
@@ -40,6 +40,33 @@ def register(server, ctx) -> None:
             - `results` 存放唯一一次调用返回值，最终返回 `results[0]`。
         """
         done, results = anyio.Event(), []
+
+        def perform_test() -> dict:
+            """仅允许从用户冻结的测试集合选择子集。"""
+            import json
+            import re
+            manifest = ctx.artifacts / "regression_tests.json"
+            generated = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+            if generated and (not ctx.config.allow_regression_tests or any(
+                    not re.fullmatch(r"tests/v5_generated/test_[a-z0-9_]+\.py", p) for p in generated)):
+                raise ValueError("回归测试未授权")
+            if tests is None and not generated:
+                return ctx.runner.run().model_dump()
+            selected = tests if tests is not None else list(ctx.config.tests) + [p for p in generated
+                if not any(p.startswith(t.rstrip("/") + "/") for t in ctx.config.tests)]
+            def authorized(path: str) -> bool:
+                """只允许原授权目录内的普通测试文件，不接受节点或命令参数。"""
+                target = ctx.workspace.path(path, source=False)
+                if path in ctx.config.tests or path in generated:
+                    return True
+                return any(ctx.workspace.path(base, source=False).is_dir()
+                    and target.is_relative_to(ctx.workspace.path(base, source=False)) for base in ctx.config.tests)
+            if not selected or len(set(selected)) != len(selected) or not all(authorized(p) for p in selected):
+                raise ValueError("测试选择超出用户授权")
+            from sandbox.docker_runner import DockerRunner
+            runner = DockerRunner(ctx.workspace, selected, ctx.config.image, timeout=ctx.config.timeout,
+                task_id=ctx.config.task_id, artifacts=ctx.artifacts)
+            return runner.run().model_dump()
 
         async def execute(*, task_status=anyio.TASK_STATUS_IGNORED):
             """执行受保护的测试任务，并保证总能发出完成信号。
@@ -63,7 +90,7 @@ def register(server, ctx) -> None:
                             lambda: ctx.invoke(
                                 "run_pytest",
                                 node,
-                                lambda: ctx.runner.run().model_dump(),
+                                perform_test,
                             )
                         )
                     )

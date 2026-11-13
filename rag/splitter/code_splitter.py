@@ -288,6 +288,10 @@ class CodeSplitter:
                     "start_line": start_line,
                     "end_line": end_line,  # 闭区间：有效字符所在的最后一行
                 })
+                from services.code_context import parent_metadata
+                chunk.metadata.update(parent_metadata(content, start_line - base_line + 1,
+                                                       end_line - base_line + 1,
+                                                       str(doc.metadata.get("relative_path", ""))))
                 file_chunks.append(chunk)
 
             if not is_ast_first:

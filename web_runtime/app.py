@@ -12,8 +12,9 @@ from threading import Lock
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from graph.budget import Limits
 from web_runtime.store import Store
 
 
@@ -24,16 +25,21 @@ class TaskInput(BaseModel):
     request: str = Field(min_length=1, max_length=4000)
     mode: str = Field(default="repair", pattern="^(repair|ask)$")
     trusted_copy: bool
-    allowed_files: list[str] = Field(min_length=1, max_length=8)
-    tests: list[str] = Field(default_factory=lambda: ["tests"], min_length=1, max_length=8)
-    image: str = Field(default="python:3.13", min_length=1)
+    allowed_files: list[str] = Field(default_factory=list, max_length=8)
+    tests: list[str] = Field(default_factory=lambda: ["tests"], max_length=8)
+    image: str = "python:3.13"
     model: str = ""
     base_url: str = ""
     api_key: str = ""
+    embedding_api_key: str = ""
+    rerank_api_key: str = ""
     max_tokens: int = Field(default=4096, ge=256, le=16384)
     context_chars: int = Field(default=24000, ge=4000, le=24000)
     max_iterations: int = Field(default=3, ge=1, le=5)
     timeout: float = Field(default=60, gt=0, le=300)
+    budget: Limits = Field(default_factory=Limits)
+    allow_regression_tests: bool = False
+    conversation: list[dict] = Field(default_factory=list, max_length=100)
 
 
 class Decision(BaseModel):
@@ -42,6 +48,8 @@ class Decision(BaseModel):
     approve: bool
     feedback: str = Field(default="", max_length=2000)
     api_key: str = ""
+    embedding_api_key: str = ""
+    rerank_api_key: str = ""
 
 
 class ApplyDecision(BaseModel):
@@ -66,6 +74,7 @@ def create_app(storage=None):
 
     #生成一个随机的本地令牌，用于验证请求来源，防止未经授权的访问。
     token = secrets.token_urlsafe(32)
+    task_keys: dict[str, dict[str, str]] = {}
 
     #创建一个线程锁，用于在多线程环境中保护对共享资源的访问，确保任务调度和状态更新的线程安全。
     application_lock = Lock()
@@ -73,15 +82,28 @@ def create_app(storage=None):
     async def monitor(task_id, process):
         """后台等待进程退出；未到持久等待点的异常退出禁止自动重放。"""
         await asyncio.to_thread(process.wait)
+        # 老审批进程可能晚于新 Worker 退出，不能清除或阻塞新进程的任务。
+        if processes.get(task_id) is not process:
+            return
         processes.pop(task_id, None)
         if store.get(task_id)["status"] == "running":
             store.update(task_id, "blocked", error="执行进程异常退出，保留现场供审查")
 
-    def launch(task_id, key=""):
+    def launch(task_id, key="", embedding_key="", rerank_key=""):
         """启动独立进程,执行任务，并跟踪生命周期；密钥不出现在命令行和任务文件中。"""
+        keys = task_keys.setdefault(task_id, {})
+        for name, value in {"AICD_WEB_API_KEY": key, "AICD_EMBEDDING_API_KEY": embedding_key,
+                            "AICD_RERANK_API_KEY": rerank_key}.items():
+            if value:
+                keys[name] = value
         env = os.environ.copy()
+        env.update(keys)
         if key:
             env["AICD_WEB_API_KEY"] = key
+        if embedding_key:
+            env["AICD_EMBEDDING_API_KEY"] = embedding_key
+        if rerank_key:
+            env["AICD_RERANK_API_KEY"] = rerank_key
         try:
             #subprocess.Popen(...) 启动一个新的 Python 进程来运行 web_runtime.worker 模块，并传入任务目录作为参数。
             process = subprocess.Popen([sys.executable, "-m", "web_runtime.worker", str(root / task_id)],
@@ -113,6 +135,8 @@ def create_app(storage=None):
             from sandbox.docker_runner import DockerRunner
             #。TaskConfig.model_validate_json(...) 同时完成“读取 + 结构校验”，保证后面构造运行器时字段类型是可信的。
             task = TaskConfig.model_validate_json(path.read_text(encoding="utf-8"))
+            if task.readonly:
+                return
             #代码临时构造一个 DockerRunner，然后调用清理：
             runner = DockerRunner(Workspace(task.workspace, trusted_copy=True), task.tests, task.image,
                 timeout=task.timeout, task_id=task_id, artifacts=path.parent)
@@ -123,7 +147,7 @@ def create_app(storage=None):
     async def lifespan(app):
         """启动时阻塞不确定任务；关闭时回收进程，保留审批等待点。"""
         for item in store.listing():
-            if item["status"] in {"running", "queued"}:
+            if item["status"] in {"running", "queued", "cancelling"}:
                 #这体现了一个明确的安全策略：服务重启后，不自动继续之前“未确认完成”的任务。
                 store.update(item["id"], "blocked", error="服务中断，禁止自动重放未确认操作")
                 await stop(item["id"])
@@ -154,6 +178,11 @@ def create_app(storage=None):
         """返回无外部脚本的本地交互页面及本次服务令牌。"""
         #服务启动时生成的 token 会被注入到页面里，前端 JS 可以在发起写请求时带上这个 token，后端中间件会验证它。
         return Path(__file__).with_name("index.html").read_text(encoding="utf-8").replace("__TOKEN__", token)
+
+    @app.get("/workspace.js")
+    def workspace_script() -> Response:
+        """返回本地功能脚本，不加载第三方资源。"""
+        return Response(Path(__file__).with_name("workspace.js").read_text(encoding="utf-8"), media_type="text/javascript")
 
     @app.get("/api/tasks")
     def history():
@@ -203,10 +232,23 @@ def create_app(storage=None):
         task_id = uuid4().hex#唯一的任务标识
         (root / task_id).mkdir()
         #目录按任务隔离，后续产物（如 task.json、日志、工件）都可以放在这个独立路径里
-        store.create(task_id, {"options": body.model_dump(exclude={"api_key"})})
+        store.create(task_id, {"options": body.model_dump(exclude={"api_key", "embedding_api_key", "rerank_api_key"})})
         store.claim(task_id, "queued")#标记任务为已排队状态，claim乐观锁，防止重复处理。
-        launch(task_id, body.api_key)
+        launch(task_id, body.api_key, body.embedding_api_key, body.rerank_api_key)
         return {"task_id": task_id}
+
+    @app.post("/api/tasks/{task_id}/followup", status_code=202)
+    async def followup(task_id: str, body: Decision):
+        """在已结束的只读会话上创建连续追问，不恢复副作用任务。"""
+        item = detail(task_id)
+        if item["options"]["mode"] != "ask" or item["status"] != "success" or not body.feedback.strip():
+            raise HTTPException(409, "仅已完成的问答可继续追问")
+        options = dict(item["options"])
+        options["conversation"] = (options.get("conversation", []) + [
+            {"role": "user", "summary": options["request"]},
+            {"role": "assistant", "summary": item.get("answer", "")}])[-100:]
+        options["request"] = body.feedback
+        return await create(TaskInput(**options, api_key=body.api_key, embedding_api_key=body.embedding_api_key, rerank_api_key=body.rerank_api_key))
 
     @app.get("/api/tasks/{task_id}/diff")
     def current_diff(task_id: str):
@@ -218,6 +260,8 @@ def create_app(storage=None):
         from mcp_servers.context import TaskConfig
         from workspace.manager import git
         task = TaskConfig.model_validate_json(path.read_text(encoding="utf-8"))
+        if task.readonly:
+            return {"diff": ""}
         value = git(Path(task.workspace), "diff", "--no-ext-diff", "--no-textconv",
                     task.base_commit, "--", *task.allowed_files)
         if len(value.encode("utf-8")) > 524288:
@@ -228,10 +272,10 @@ def create_app(storage=None):
     async def approve(task_id: str, body: Decision):
         """核对等待点并原子领取；重复审批不会再次启动工作进程。"""
         item = detail(task_id)
-        if item.get("approval", {}).get("id") != body.approval_id or not store.claim(task_id, "waiting"):
+        if not store.claim(task_id, "waiting", body.approval_id):
             raise HTTPException(409, "审批已处理或等待点已改变")
-        store.update(task_id, "running", decision=body.model_dump(exclude={"api_key", "approval_id"}))
-        launch(task_id, body.api_key)
+        store.update(task_id, "running", decision=body.model_dump(exclude={"api_key", "embedding_api_key", "rerank_api_key", "approval_id"}))
+        launch(task_id, body.api_key, body.embedding_api_key, body.rerank_api_key)
         return {"status": "running"}
 
     @app.get("/api/tasks/{task_id}/apply-preview")
@@ -266,13 +310,20 @@ def create_app(storage=None):
             # 在任何写入前持久记录意图；进程中途退出后不自动重放。
             store.update(task_id, item["status"], application_status="applying")
             try:
-                records = apply_application(editor, batch)
+                from graph.operations import OperationJournal
+                (root / task_id).mkdir(exist_ok=True)
+                records = OperationJournal(root / task_id / "operations.sqlite").run(
+                    "repository.apply", {"batch": batch.model_dump() if batch else None, "preview": preview},
+                    lambda: apply_application(editor, batch))
             except (OSError, ValueError, RuntimeError, SyntaxError):
                 store.update(task_id, item["status"], application_status="uncertain")
                 raise HTTPException(409, "应用失败，请检查原仓库；不会自动覆盖或重试")
             store.update(task_id, item["status"], application_status="applied", applied_changes=records,
                          applied_repository=preview["repository"])
             return {"applied": True, "changes": records}
+
+    from web_runtime.memory_routes import register_memory_routes
+    register_memory_routes(app, root, store)
 
     @app.post("/api/tasks/{task_id}/{action}")
     async def control(task_id: str, action: str):

@@ -26,6 +26,7 @@ data/
 !/docs/v5_03_retrieval.md
 !/docs/v5_04_memory.md
 !/docs/v5_05_web_evaluation.md
+!/docs/web_chat.md
 !/docs/validation/step_03_05.md
 !/docs/validation/news_v5/
 /docs/validation/news_v5/*

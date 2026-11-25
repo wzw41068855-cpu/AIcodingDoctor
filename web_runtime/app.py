@@ -184,6 +184,21 @@ def create_app(storage=None):
         """返回本地功能脚本，不加载第三方资源。"""
         return Response(Path(__file__).with_name("workspace.js").read_text(encoding="utf-8"), media_type="text/javascript")
 
+    @app.get("/workbench.js")
+    @app.get("/chat.js")
+    @app.get("/workbench.css")
+    def workbench_asset(request: Request) -> Response:
+        """返回固定白名单内的工作台资源。
+
+        Args:
+            request: 已匹配固定资源路由的请求。
+        Returns:
+            本地脚本或样式，不接受客户端指定文件路径。
+        """
+        name = request.url.path.removeprefix("/")
+        media = "text/css" if name.endswith(".css") else "text/javascript"
+        return Response(Path(__file__).with_name(name).read_text(encoding="utf-8"), media_type=media)
+
     @app.get("/api/tasks")
     def history():
         """列出持久任务历史。"""

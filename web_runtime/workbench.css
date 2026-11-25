@@ -1,0 +1,67 @@
+:root{font:15px/1.6 system-ui,sans-serif;color:#182332;background:#f5f7fb;--accent:#315be8;--line:#e0e6ef}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{max-width:1240px;margin:0 auto;padding:28px}
+header{display:flex;align-items:center;justify-content:space-between}
+header p,.muted{color:#64748b;font-size:13px}
+.brand{font-size:23px;font-weight:750}
+.brand small{font-size:12px;background:#e7edff;color:var(--accent);padding:3px 7px;border-radius:6px}
+nav{display:flex;gap:6px;margin:18px 0}
+nav button{background:transparent;border-color:transparent;font-weight:650}
+nav button[aria-pressed=true]{background:#e7edff;color:#2449ca;border-color:#c9d6ff}
+section,aside{background:#fff;border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:18px}
+h1{font-size:22px;margin:0 0 5px}
+h2{font-size:16px;margin:0 0 12px}
+h3{font-size:14px}
+p{margin:6px 0 12px}
+.row,.section-heading,.composer-footer{display:flex;gap:12px;align-items:center;justify-content:space-between}
+.row input{flex:1;min-width:0}
+.section-heading h2{margin:0}
+.section-heading{margin-bottom:12px}
+input,textarea,select{font:inherit;border:1px solid #cbd5e1;border-radius:8px;padding:9px;background:#fff;color:inherit;max-width:100%}
+input:not([type=checkbox]),select{width:100%}
+input[type=checkbox]{accent-color:var(--accent)}
+textarea{width:100%;min-height:100px;resize:vertical}
+button{font:inherit;border:1px solid #cbd5e1;border-radius:8px;background:#fff;padding:8px 13px;cursor:pointer;white-space:nowrap}
+button:hover{background:#eff3ff}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button:disabled{opacity:.5;cursor:wait}
+button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid #9cb5ff;outline-offset:2px}
+label{display:block;margin:8px 0;font-size:13px}
+label input[type=checkbox]{width:auto}
+.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 20px}
+details{margin:12px 0}
+summary{cursor:pointer;color:#475569;font-size:13px}
+.layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:20px}
+aside{align-self:start;padding:16px;max-height:75vh;overflow:auto;position:sticky;top:20px}
+#history button{display:block;white-space:normal;text-align:left;width:100%;font-size:13px;margin:8px 0;border-color:transparent;overflow-wrap:anywhere}
+#history button.active{background:#edf2ff;color:#2649c4}
+#messages{min-height:270px;max-height:60vh;overflow:auto;padding:8px 0 20px}
+.message{margin:15px 0;max-width:94%;overflow-wrap:anywhere}
+.message.user{margin-left:auto;background:#edf2ff;border-radius:12px 12px 3px 12px;padding:12px 16px}
+.message.assistant{border-left:3px solid #dce5ff;padding:4px 16px}
+.message strong{display:block;font-size:12px;color:#64748b;margin-bottom:6px}
+.message p{white-space:pre-wrap;margin:0;font:inherit}
+.empty-state{text-align:center;color:#64748b;padding:55px 20px}
+.empty-state strong{font-size:18px;display:block;color:#334155;margin-bottom:10px}
+#chat-status,#task-status{font-size:13px;color:#475569;background:#f0f4ff;border-radius:8px;padding:10px;margin:10px 0}
+#chat-status:empty{display:none}
+.composer-footer{font-size:12px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f6fa;padding:14px;border-radius:8px;font:12px/1.7 ui-monospace,Consolas,monospace}
+#error:empty{display:none}
+#error{background:#fff0f0;padding:12px;border-radius:8px;color:#a82828}
+.node-card{border:1px solid var(--line);border-radius:8px;margin:12px 0;padding:12px}
+.spinner{display:inline-block;width:15px;height:15px;border:2px solid #cbd5e1;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin-right:8px}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+@keyframes spin{to{transform:rotate(360deg)}
+}
+@media(max-width:760px){body{padding:14px}
+header{display:block}
+.layout{grid-template-columns:1fr}
+aside{position:static;max-height:180px}
+.settings-grid{grid-template-columns:1fr}
+.composer-footer,.section-heading{flex-wrap:wrap}
+section{padding:16px}
+#messages{max-height:55vh}
+}
+

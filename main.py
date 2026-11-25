@@ -1,4 +1,4 @@
-"""AICodingDoctor V4 本地 Web 启动入口。
+"""AICodingDoctor V5 本地 Web 启动入口。
 
 执行 `python main.py`，或直接使用 uvicorn 的单 worker 模式。
 """
